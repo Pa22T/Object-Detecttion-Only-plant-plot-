@@ -1,0 +1,123 @@
+# Crop-Row Pot Detection & Steering Angle (θ) Estimation
+
+Real-time computer vision module for an autonomous mobile robot (AMR) navigating between rows of potted plants in a greenhouse. The module detects pots with **YOLOv8**, fits each crop row to a line, and converts the row geometry into a **steering angle (θ)** that is streamed to an Arduino-based motor controller.
+
+> Part of a senior thesis project on vision-based autonomous navigation for greenhouse AMRs.
+
+---
+
+## How It Works
+
+The core pipeline runs on every camera frame:
+
+**1. Pot Detection (YOLOv8)**
+A custom-trained YOLOv8 model (`best.pt`, single class: `pot`) runs inference on each frame to produce bounding boxes for every visible pot.
+
+```python
+results = model(rgb, imgsz=IMG_SIZE, conf=CONF_THR, verbose=False)
+```
+
+**2. Bottom-Point Extraction & Row Classification**
+For each detected box, the bottom-center point `(px, py)` is taken as the pot's ground-contact position (more stable for distance estimation than the box center). Each point is then assigned to the **left** or **right** crop row based on its horizontal position relative to the frame's split line, with a configurable dead-zone to reject ambiguous, centrally-located points.
+
+```python
+def extract_bottom_points(results, frame_w, frame_h, split_x, deadzone_px, prev_lane_center_x=None):
+    # px, py = bottom-center of each bounding box
+    # zone = "left" / "right" / "ignore" (inside deadzone)
+    ...
+```
+
+**3. Row Line Fitting — x = m·y + b**
+Points on each side are fitted to a line expressed as **x as a function of y** (rather than the usual y = mx + b). This form handles the near-vertical crop rows seen from the robot's forward-facing camera, where a standard y = mx + b fit becomes numerically unstable as slope → ∞.
+
+```python
+def fit_x_as_function_of_y(points):
+    m, b = np.polyfit(pts[:, 1], pts[:, 0], 1)   # x = m*y + b
+    return float(m), float(b)
+```
+
+**4. Lane Center Estimation (Lookahead)**
+Both row lines are evaluated at a fixed lookahead row (`Y_PIXEL_AT_TARGET`) to get the left/right row x-position at a consistent forward distance. If only one row is visible, the center is estimated using the last known lane width as a fallback.
+
+**5. Theta Calculation**
+The pixel offset between the lane center and the image center is converted to a real-world lateral offset (meters) using a pixel-to-meter calibration ratio, then converted to an angle via `atan2` against the calibrated forward target distance:
+
+```python
+dx_m = (lane_center_x - frame_w/2) / PXM_RATIO_AT_TARGET
+theta_deg = degrees(atan2(dx_m, TARGET_DIST_M))
+```
+
+A small dead-band suppresses jitter near zero, and a steering gain scales the result to a control-friendly range. If only one row is detected, an additional gain compensates for the reduced confidence of a single-sided estimate.
+
+**6. Smoothing & Clamping**
+θ is averaged over the last `N` frames (moving-average buffer) to reduce frame-to-frame noise, then clamped to a safe range (±5°) before being sent to the motor controller.
+
+---
+
+## Key Parameters
+
+| Parameter | Description |
+|---|---|
+| `CONF_THR` | YOLOv8 detection confidence threshold |
+| `IMG_SIZE` | Inference input resolution |
+| `CAMERA_HEIGHT_M`, `TARGET_DIST_M` | Camera mounting calibration (height & lookahead distance) used to derive pitch |
+| `PXM_RATIO_AT_TARGET` | Pixel-to-meter conversion ratio at the target lookahead distance |
+| `Y_PIXEL_AT_TARGET` | Row (pixel y) at which the fitted lines are evaluated (lookahead row) |
+| `LANE_SPLIT_DEADZONE_PX` | Half-width of the center dead-zone used to ignore ambiguous detections |
+| `STEER_GAIN` | Scales raw theta into the control signal |
+| `THETA_DEADBAND` | Minimum angle (deg) before a correction is applied |
+| `THETA_SMOOTH_N` | Number of frames averaged for the smoothed theta output |
+| `ONE_SIDE_OPPOSITE_GAIN` | Extra gain applied when only one crop row is detected |
+
+---
+
+## Requirements
+
+```
+ultralytics
+opencv-python
+numpy
+pyserial
+```
+
+```bash
+pip install ultralytics opencv-python numpy pyserial
+```
+
+A trained YOLOv8 weights file named **`best.pt`** must be placed in the working directory.
+
+---
+
+## Usage
+
+```bash
+python pot_detection_theta.py
+```
+
+- Reads from a live camera (`CAMERA_INDEX`) or a video file (`VIDEO_PATH`).
+- Displays a live annotated window (detected pots, fitted lane center, current θ).
+- Logs per-frame results to `theta_real_dist_log.csv`:
+
+| frame | theta_deg | dx_meters | status |
+|---|---|---|---|
+| frame index | smoothed, clamped steering angle | lateral offset in meters | `NORMAL` / `EMERGENCY_TURN` |
+
+---
+
+## Notes
+
+- Accurate real-world θ depends on correct camera calibration (`CAMERA_HEIGHT_M`, `TARGET_DIST_M`, `PXM_RATIO_AT_TARGET`) for the specific camera mounting height and angle.
+- The script also includes a front-point collision check and emergency-turn override, and streams the resulting θ to an Arduino over serial for closed-loop steering control — these run alongside the detection/theta pipeline described above.
+
+---
+
+## Model Performance
+
+Trained on a custom Roboflow dataset (~4,066 images, single `pot` class):
+
+| Metric | Score |
+|---|---|
+| F1-score | 0.9888 |
+| mAP@50 | 0.9902 |
+
+*(Adjust these figures if your final model evaluation differs.)*
